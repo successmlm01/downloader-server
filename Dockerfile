@@ -1,7 +1,9 @@
-FROM node:20
+FROM node:18
 
-RUN apt-get update && apt-get install -y python3 python3-pip
-RUN pip3 install yt-dlp --break-system-packages
+# installer yt-dlp et python
+RUN apt-get update && apt-get install -y python3 python3-pip ffmpeg
+
+RUN pip3 install yt-dlp
 
 WORKDIR /app
 
@@ -11,6 +13,6 @@ RUN npm install
 
 COPY . .
 
-EXPOSE 3000
+EXPOSE 8080
 
 CMD ["node", "server.js"]
