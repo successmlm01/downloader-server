@@ -3,7 +3,6 @@ import cors from "cors"
 import { exec } from "child_process"
 
 const app = express()
-
 app.use(cors())
 app.use(express.json())
 
@@ -11,10 +10,8 @@ app.get("/", (req, res) => {
   res.send("Downloader API running")
 })
 
-// Route pour récupérer les formats disponibles
 app.post("/info", (req, res) => {
   const { url } = req.body
-
   if (!url) return res.status(400).json({ error: "No URL provided" })
 
   const safeUrl = url.replace(/"/g, "")
@@ -27,37 +24,56 @@ app.post("/info", (req, res) => {
     }
 
     let info
-    try {
-      info = JSON.parse(stdout)
-    } catch {
-      return res.status(500).json({ error: "Erreur de parsing" })
+    try { info = JSON.parse(stdout) }
+    catch { return res.status(500).json({ error: "Erreur de parsing" }) }
+
+    const allFormats = info.formats || []
+
+    // Formats progressifs = vidéo + audio dans le même fichier
+    const progressive = allFormats.filter(
+      (f) =>
+        f.url &&
+        f.vcodec && f.vcodec !== "none" &&
+        f.acodec && f.acodec !== "none" &&
+        f.height
+    )
+
+    // Une qualité par résolution, garder le meilleur bitrate
+    const byHeight = {}
+    for (const f of progressive) {
+      const h = f.height
+      if (!byHeight[h] || (f.filesize || 0) > (byHeight[h].filesize || 0)) {
+        byHeight[h] = f
+      }
     }
 
-    // Construire la liste des qualités disponibles
-    const formats = (info.formats || [])
-      .filter((f) => f.ext === "mp4" && f.height && f.url)
-      .reduce((acc, f) => {
-        const key = f.height
-        if (!acc[key] || f.filesize > (acc[key].filesize || 0)) {
-          acc[key] = f
-        }
-        return acc
-      }, {})
-
-    const qualities = Object.entries(formats)
+    let qualities = Object.entries(byHeight)
       .sort((a, b) => Number(b[0]) - Number(a[0]))
       .map(([height, f]) => ({
         label: `${height}p`,
         height: Number(height),
         url: f.url,
         filesize: f.filesize || null,
+        hasAudio: true,
       }))
 
-    // Fallback si aucun mp4
+    // Fallback si aucun format progressif
     if (qualities.length === 0) {
-      const fallback = (info.formats || []).find((f) => f.url)
-      if (fallback) {
-        qualities.push({ label: "Auto", height: 0, url: fallback.url, filesize: null })
+      const fallback = allFormats
+        .filter((f) => f.url && f.height)
+        .sort((a, b) => (b.height || 0) - (a.height || 0))
+      const seen = {}
+      for (const f of fallback) {
+        if (!seen[f.height]) {
+          seen[f.height] = true
+          qualities.push({
+            label: `${f.height}p`,
+            height: f.height,
+            url: f.url,
+            filesize: f.filesize || null,
+            hasAudio: f.acodec && f.acodec !== "none",
+          })
+        }
       }
     }
 
@@ -67,34 +83,6 @@ app.post("/info", (req, res) => {
       duration: info.duration || null,
       uploader: info.uploader || null,
       qualities,
-    })
-  })
-})
-
-// Route de téléchargement direct (garde la compatibilité)
-app.post("/download", (req, res) => {
-  const { url } = req.body
-  if (!url) return res.status(400).json({ error: "No URL provided" })
-
-  const safeUrl = url.replace(/"/g, "")
-  const command = `yt-dlp -j --no-playlist "${safeUrl}"`
-
-  exec(command, { timeout: 30000 }, (error, stdout) => {
-    if (error) return res.status(500).json({ error: "Failed to fetch video info" })
-
-    let info
-    try { info = JSON.parse(stdout) } catch { return res.status(500).json({ error: "Parse error" }) }
-
-    const formats = (info.formats || []).filter((f) => f.ext === "mp4" && f.url)
-    const best = formats.length > 0 ? formats[formats.length - 1] : (info.formats || []).find((f) => f.url)
-
-    if (!best) return res.status(500).json({ error: "No downloadable format found" })
-
-    res.json({
-      title: info.title || "Video",
-      thumbnail: info.thumbnail || null,
-      download: best.url,
-      ext: best.ext || "mp4",
     })
   })
 })
