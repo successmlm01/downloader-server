@@ -1,21 +1,29 @@
 import express from "express"
 import cors from "cors"
-import ytdlp from "yt-dlp-exec"
+import { exec } from "child_process"
 
 const app = express()
 
 app.use(cors())
 app.use(express.json())
 
-app.post("/download", async (req, res) => {
+app.post("/download", (req, res) => {
 
   const { url } = req.body
 
-  try {
+  if (!url) {
+    return res.json({ error: "No URL provided" })
+  }
 
-    const info = await ytdlp(url, {
-      dumpSingleJson: true
-    })
+  const command = `yt-dlp -j "${url}"`
+
+  exec(command, (error, stdout) => {
+
+    if (error) {
+      return res.json({ error: "Failed to fetch video" })
+    }
+
+    const info = JSON.parse(stdout)
 
     const formats = info.formats.filter(f => f.ext === "mp4")
 
@@ -27,16 +35,12 @@ app.post("/download", async (req, res) => {
       download: best.url
     })
 
-  } catch (error) {
-
-    res.json({
-      error: "Video not supported"
-    })
-
-  }
+  })
 
 })
 
-app.listen(3000, () => {
-  console.log("Downloader server running")
+const PORT = process.env.PORT || 3000
+
+app.listen(PORT, () => {
+  console.log("Downloader API running on port " + PORT)
 })
