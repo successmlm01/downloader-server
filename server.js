@@ -7,6 +7,11 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
+// route test
+app.get("/", (req, res) => {
+  res.send("Downloader API running")
+})
+
 app.post("/download", (req, res) => {
 
   const { url } = req.body
@@ -20,6 +25,7 @@ app.post("/download", (req, res) => {
   exec(command, (error, stdout) => {
 
     if (error) {
+      console.error(error)
       return res.json({ error: "Failed to fetch video" })
     }
 
@@ -41,6 +47,7 @@ app.post("/download", (req, res) => {
 
 const PORT = process.env.PORT || 3000
 
-app.listen(PORT, () => {
-  console.log("Downloader API running on port " + PORT)
+// IMPORTANT POUR RAILWAY
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("Server running on port " + PORT)
 })
