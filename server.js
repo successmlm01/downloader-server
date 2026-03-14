@@ -11,6 +11,25 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
+// ─── Utilitaire : exécuter une commande et retourner stdout ───────────────
+function run(cmd, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args, opts)
+    let stdout = ""
+    let stderr = ""
+    proc.stdout?.on("data", (d) => { stdout += d.toString() })
+    proc.stderr?.on("data", (d) => {
+      stderr += d.toString()
+      console.log(`[${cmd}]`, d.toString().trim())
+    })
+    proc.on("close", (code) => {
+      if (code === 0) resolve({ stdout, stderr })
+      else reject(new Error(`${cmd} exited ${code}: ${stderr.slice(-300)}`))
+    })
+    proc.on("error", reject)
+  })
+}
+
 // ─── Détection de plateforme ──────────────────────────────────────────────
 function detectPlatform(url) {
   if (/tiktok\.com/i.test(url))             return "tiktok"
@@ -35,19 +54,15 @@ function platformArgs(platform) {
 function buildQualities(info, platform) {
   const formats = info.formats || []
 
-  // Formats avec vidéo ET audio fusionnés (TikTok, Instagram)
   const mergedFormats = formats.filter(
     (f) => f.vcodec && f.vcodec !== "none" && f.acodec && f.acodec !== "none" && f.url
   )
-
-  // Formats vidéo seuls (YouTube, Facebook — height peut être null)
   const videoOnlyFormats = formats.filter(
     (f) => f.vcodec && f.vcodec !== "none" && (!f.acodec || f.acodec === "none") && f.url
   )
 
   let qualities = []
 
-  // ── Formats fusionnés (TikTok, Instagram) ──
   if (mergedFormats.length > 0) {
     const byKey = {}
     for (const f of mergedFormats) {
@@ -57,22 +72,17 @@ function buildQualities(info, platform) {
     qualities = Object.entries(byKey)
       .sort((a, b) => (parseInt(b[0]) || 0) - (parseInt(a[0]) || 0))
       .map(([key, f]) => ({
-        label:      key,
-        height:     f.height || 0,
-        formatId:   f.format_id,
-        filesize:   f.filesize || f.filesize_approx || null,
-        needsMerge: false,
+        label: key, height: f.height || 0, formatId: f.format_id,
+        filesize: f.filesize || f.filesize_approx || null, needsMerge: false,
       }))
   }
 
-  // ── Formats vidéo seuls (YouTube, Facebook) ──
   if (videoOnlyFormats.length > 0) {
     const byKey = {}
     for (const f of videoOnlyFormats) {
       const key = f.height ? `${f.height}p` : (f.format_note || f.format_id || "Video")
-      // Préférer H.264 (avc) sur VP9 à hauteur identique
       const cur = byKey[key]
-      const fH264  = (f.vcodec || "").startsWith("avc")
+      const fH264 = (f.vcodec || "").startsWith("avc")
       const curH264 = cur ? (cur.vcodec || "").startsWith("avc") : false
       if (!cur || (!curH264 && fH264) || (fH264 === curH264 && (f.tbr || 0) > (cur.tbr || 0))) {
         byKey[key] = { ...f }
@@ -80,19 +90,15 @@ function buildQualities(info, platform) {
     }
     const voQ = Object.entries(byKey)
       .sort((a, b) => {
-        const ha = parseInt(a[0]) || 0
-        const hb = parseInt(b[0]) || 0
+        const ha = parseInt(a[0]) || 0, hb = parseInt(b[0]) || 0
         if (hb !== ha) return hb - ha
         if (a[0].toLowerCase() === "hd") return -1
         if (b[0].toLowerCase() === "hd") return  1
         return 0
       })
       .map(([key, f]) => ({
-        label:      key,
-        height:     f.height || 0,
-        formatId:   f.format_id,
-        filesize:   f.filesize || f.filesize_approx || null,
-        needsMerge: true,
+        label: key, height: f.height || 0, formatId: f.format_id,
+        filesize: f.filesize || f.filesize_approx || null, needsMerge: true,
       }))
     qualities = [...qualities, ...voQ]
   }
@@ -100,53 +106,7 @@ function buildQualities(info, platform) {
   if (qualities.length === 0) {
     qualities = [{ label: "Best", height: 0, formatId: "best", filesize: null, needsMerge: false }]
   }
-
   return qualities
-}
-
-// ─── Construire le format selector yt-dlp ────────────────────────────────
-//
-// Objectif : H.264 + AAC natifs dans le fichier final
-//   → compatible QuickTime, iOS, Android, Windows sans réencodage
-//   → réencodage = lent + risque de perte audio si mal configuré
-//
-// Facebook : URLs signées expirent → sélecteur par hauteur uniquement
-// YouTube  : format_id stable → on l'utilise directement
-//
-function buildSelector(platform, formatId, height, needsMerge) {
-  if (!needsMerge) {
-    // TikTok / Instagram merged : format direct, pas de merge
-    return formatId
-  }
-
-  if (platform === "facebook" || platform === "generic") {
-    // Facebook : URLs signées expirent → sélecteur basé sur hauteur
-    // On construit une chaîne de fallbacks du plus strict au plus permissif
-    const h = height || 0
-    const hFilter = h > 0 ? `[height<=${h}]` : ""
-    const hExact  = h > 0 ? `[height=${h}]`  : ""
-
-    return [
-      // Idéal : H.264 + AAC m4a à la bonne hauteur
-      `bestvideo[vcodec^=avc]${hExact}+bestaudio[ext=m4a]`,
-      // H.264 + AAC à hauteur ≤
-      `bestvideo[vcodec^=avc]${hFilter}+bestaudio[ext=m4a]`,
-      // H.264 + n'importe quel audio
-      `bestvideo[vcodec^=avc]${hFilter}+bestaudio`,
-      // N'importe quelle vidéo + AAC m4a
-      `bestvideo${hFilter}+bestaudio[ext=m4a]`,
-      // N'importe quelle vidéo + n'importe quel audio
-      `bestvideo${hFilter}+bestaudio`,
-      // Dernier recours : meilleur format unique (déjà merged)
-      `best`,
-    ].join("/")
-  }
-
-  // YouTube / Instagram vidéo-only : format_id stable
-  return [
-    `${formatId}+bestaudio[ext=m4a]`,
-    `${formatId}+bestaudio`,
-  ].join("/")
 }
 
 // ─── GET / ───────────────────────────────────────────────────────────────
@@ -161,14 +121,11 @@ app.post("/info", (req, res) => {
 
   const platform = detectPlatform(url)
   const safeUrl  = url.replace(/"/g, "").trim()
-  const args     = ["--no-playlist", "-j", ...platformArgs(platform), safeUrl]
 
   console.log(`[info] platform=${platform} url=${safeUrl}`)
 
-  const proc = spawn("yt-dlp", args, { timeout: 45000 })
-  let stdout = ""
-  let stderr = ""
-
+  const proc = spawn("yt-dlp", ["--no-playlist", "-j", ...platformArgs(platform), safeUrl], { timeout: 45000 })
+  let stdout = "", stderr = ""
   proc.stdout.on("data", (d) => { stdout += d.toString() })
   proc.stderr.on("data", (d) => { stderr += d.toString() })
 
@@ -176,54 +133,45 @@ app.post("/info", (req, res) => {
     if (code !== 0) {
       console.error(`[info] yt-dlp exit ${code}:`, stderr.slice(0, 500))
       let msg = "Unable to fetch this video"
-      if (stderr.includes("Private") || stderr.includes("private"))
-        msg = "This video is private or inaccessible"
-      else if (stderr.includes("not a video"))
-        msg = "This link does not point to a video"
-      else if (platform === "instagram" && stderr.includes("login"))
-        msg = "This Instagram post requires login"
-      else if (platform === "tiktok" && stderr.includes("Unable"))
-        msg = "TikTok video inaccessible — make sure the link is public"
-      else if (platform === "facebook" && stderr.includes("login"))
-        msg = "This Facebook video requires login"
+      if (stderr.includes("Private") || stderr.includes("private")) msg = "This video is private or inaccessible"
+      else if (stderr.includes("not a video"))                       msg = "This link does not point to a video"
+      else if (platform === "instagram" && stderr.includes("login")) msg = "This Instagram post requires login"
+      else if (platform === "tiktok"    && stderr.includes("Unable"))msg = "TikTok video inaccessible — make sure the link is public"
+      else if (platform === "facebook"  && stderr.includes("login")) msg = "This Facebook video requires login"
       return res.status(500).json({ error: msg })
     }
-
     let info
     try   { info = JSON.parse(stdout) }
     catch { return res.status(500).json({ error: "Parsing error" }) }
 
     const qualities = buildQualities(info, platform)
-    console.log(
-      `[info] ${qualities.length} quality(ies):`,
-      qualities.map((q) => `${q.label}(merge=${q.needsMerge})`).join(" | ")
-    )
-
+    console.log(`[info] ${qualities.length} quality(ies):`, qualities.map((q) => `${q.label}(merge=${q.needsMerge})`).join(" | "))
     res.json({
-      title:       info.title     || "Video",
-      thumbnail:   info.thumbnail || null,
-      duration:    info.duration  || null,
-      uploader:    info.uploader  || info.channel || info.creator || null,
-      originalUrl: url,
-      platform,
-      qualities,
+      title: info.title || "Video", thumbnail: info.thumbnail || null,
+      duration: info.duration || null, uploader: info.uploader || info.channel || info.creator || null,
+      originalUrl: url, platform, qualities,
     })
   })
-
-  proc.on("error", (err) => {
-    console.error("[info] spawn error:", err)
-    res.status(500).json({ error: "Server error" })
-  })
+  proc.on("error", (err) => { console.error("[info] spawn error:", err); res.status(500).json({ error: "Server error" }) })
 })
 
 // ─── GET /stream ──────────────────────────────────────────────────────────
-// Architecture fichier temporaire (obligatoire pour DASH/Facebook) :
-//   yt-dlp + ffmpeg merge → /tmp/uuid.mp4 complet → stream → suppression
 //
-// PAS de --postprocessor-args réencodage :
-//   Le réencodage avec --postprocessor-args ne mappe pas l'audio correctement
-//   → fichier avec vidéo seulement, pas d'audio
-//   Le sélecteur H.264+AAC natif est suffisant et plus rapide
+// Architecture : 2 téléchargements séparés + merge ffmpeg explicite
+//
+//   Étape 1 : yt-dlp -f "bestvideo[vcodec^=avc]..."  → /tmp/uuid_v.mp4
+//   Étape 2 : yt-dlp -f "bestaudio"                  → /tmp/uuid_a.m4a
+//   Étape 3 : ffmpeg -i video -i audio
+//                    -map 0:v:0 -map 1:a:0            ← mapping EXPLICITE
+//                    -c:v copy -c:a aac               → /tmp/uuid_out.mp4
+//   Étape 4 : stream le fichier final → client
+//   Étape 5 : supprimer les 3 fichiers temp
+//
+// Pourquoi cette approche :
+//   - Le merge interne yt-dlp ne garantit pas l'inclusion de l'audio
+//     quand l'ext de l'audio Facebook n'est pas reconnu comme compatible
+//   - ffmpeg avec -map explicite garantit que vidéo ET audio sont présents
+//   - -c:a aac réencode l'audio si nécessaire pour compatibilité QuickTime
 //
 app.get("/stream", async (req, res) => {
   const { url, formatId, height, title, needsMerge } = req.query
@@ -236,82 +184,93 @@ app.get("/stream", async (req, res) => {
   const platform     = detectPlatform(safeUrl)
   const shouldMerge  = needsMerge === "true"
 
-  const selector = buildSelector(platform, safeFormatId, safeHeight, shouldMerge)
-  const tmpFile  = join(tmpdir(), `dl_${randomUUID()}.mp4`)
+  const uid      = randomUUID()
+  const videoTmp = join(tmpdir(), `dl_${uid}_v.mp4`)
+  const audioTmp = join(tmpdir(), `dl_${uid}_a.m4a`)
+  const outTmp   = join(tmpdir(), `dl_${uid}_out.mp4`)
 
-  console.log(`[stream] platform=${platform} h=${safeHeight} selector="${selector}"`)
-  console.log(`[stream] tmpFile=${tmpFile}`)
+  const cleanup  = () => Promise.all([videoTmp, audioTmp, outTmp].map((f) => unlink(f).catch(() => {})))
 
-  const args = [
-    "--no-playlist",
-    ...platformArgs(platform),
-    "-f", selector,
-    "--merge-output-format", "mp4",
-    "-o", tmpFile,
-    safeUrl,
-  ]
+  console.log(`[stream] platform=${platform} h=${safeHeight} merge=${shouldMerge} uid=${uid}`)
 
-  const ytdlp = spawn("yt-dlp", args)
-  let stderrLog = ""
+  try {
+    if (!shouldMerge) {
+      // ── TikTok / Instagram merged : téléchargement direct ──────────────
+      console.log(`[stream] merged format, downloading directly`)
+      await run("yt-dlp", [
+        "--no-playlist",
+        ...platformArgs(platform),
+        "-f", safeFormatId,
+        "--merge-output-format", "mp4",
+        "-o", outTmp,
+        safeUrl,
+      ])
+    } else {
+      // ── Étape 1 : télécharger la vidéo (H.264 préféré) ─────────────────
+      const h = safeHeight
+      const hFilter = h > 0 ? `[height<=${h}]` : ""
 
-  ytdlp.stderr.on("data", (d) => {
-    const line = d.toString().trim()
-    stderrLog += line + "\n"
-    console.log("[stream] yt-dlp:", line)
-  })
+      const videoSelector = [
+        `bestvideo[vcodec^=avc]${h > 0 ? `[height=${h}]` : ""}`,
+        `bestvideo[vcodec^=avc]${hFilter}`,
+        `bestvideo${hFilter}`,
+        `bestvideo`,
+      ].join("/")
 
-  let aborted = false
-  req.on("close", () => {
-    if (!res.writableEnded) {
-      aborted = true
-      ytdlp.kill()
-      unlink(tmpFile).catch(() => {})
+      console.log(`[stream] Step 1 — video: ${videoSelector}`)
+      await run("yt-dlp", [
+        "--no-playlist",
+        ...platformArgs(platform),
+        "-f", videoSelector,
+        "-o", videoTmp,
+        safeUrl,
+      ])
+
+      // ── Étape 2 : télécharger l'audio séparément ───────────────────────
+      const audioSelector = "bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio"
+      console.log(`[stream] Step 2 — audio: ${audioSelector}`)
+      await run("yt-dlp", [
+        "--no-playlist",
+        ...platformArgs(platform),
+        "-f", audioSelector,
+        "-o", audioTmp,
+        safeUrl,
+      ])
+
+      // ── Étape 3 : merge ffmpeg avec mapping EXPLICITE ───────────────────
+      console.log(`[stream] Step 3 — ffmpeg merge with explicit -map`)
+      await run("ffmpeg", [
+        "-y",
+        "-i", videoTmp,   // input 0 = vidéo
+        "-i", audioTmp,   // input 1 = audio
+        "-map", "0:v:0",  // prendre stream vidéo du fichier 0
+        "-map", "1:a:0",  // prendre stream audio du fichier 1
+        "-c:v", "copy",   // copier vidéo sans réencodage (rapide)
+        "-c:a", "aac",    // réencoder audio en AAC (compatible QuickTime/iOS)
+        "-movflags", "+faststart", // moov atom en début = lecture immédiate
+        outTmp,
+      ])
     }
-  })
 
-  ytdlp.on("close", async (code) => {
-    if (aborted) return
+    // ── Étape 4 : vérifier et streamer ────────────────────────────────────
+    const stats = await stat(outTmp)
+    if (stats.size === 0) throw new Error("Output file is empty")
 
-    if (code !== 0) {
-      console.error(`[stream] yt-dlp exited ${code}`, stderrLog.slice(-400))
-      if (!res.headersSent) res.status(500).json({ error: "Download failed — check the URL is public" })
-      unlink(tmpFile).catch(() => {})
-      return
-    }
+    console.log(`[stream] Ready: ${(stats.size / 1e6).toFixed(1)} MB → streaming`)
 
-    try {
-      const stats = await stat(tmpFile)
-      if (stats.size === 0) {
-        console.error("[stream] Empty temp file")
-        if (!res.headersSent) res.status(500).json({ error: "Empty file — format unavailable" })
-        unlink(tmpFile).catch(() => {})
-        return
-      }
+    res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.mp4"`)
+    res.setHeader("Content-Type", "video/mp4")
+    res.setHeader("Content-Length", stats.size)
 
-      console.log(`[stream] Ready: ${(stats.size / 1e6).toFixed(1)} MB → streaming to client`)
+    const rs = createReadStream(outTmp)
+    rs.pipe(res)
+    rs.on("close", () => { cleanup(); console.log("[stream] Sent & cleaned up") })
 
-      res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.mp4"`)
-      res.setHeader("Content-Type", "video/mp4")
-      res.setHeader("Content-Length", stats.size)
-
-      const rs = createReadStream(tmpFile)
-      rs.pipe(res)
-      rs.on("close", () => {
-        unlink(tmpFile).catch(() => {})
-        console.log("[stream] Sent & cleaned up")
-      })
-    } catch (err) {
-      console.error("[stream] File error:", err)
-      if (!res.headersSent) res.status(500).json({ error: "File not found after download" })
-      unlink(tmpFile).catch(() => {})
-    }
-  })
-
-  ytdlp.on("error", (err) => {
-    console.error("[stream] spawn error:", err)
-    if (!res.headersSent) res.status(500).json({ error: "Server error" })
-    unlink(tmpFile).catch(() => {})
-  })
+  } catch (err) {
+    console.error("[stream] Error:", err.message)
+    cleanup()
+    if (!res.headersSent) res.status(500).json({ error: "Download failed — " + err.message.split("\n")[0] })
+  }
 })
 
 const PORT = process.env.PORT || 8080
