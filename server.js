@@ -40,7 +40,7 @@ function buildQualities(info, platform) {
     (f) => f.vcodec && f.vcodec !== "none" && f.acodec && f.acodec !== "none" && f.url
   )
 
-  // Formats vidéo seuls — height optionnel (Facebook hd/sd n'ont pas height)
+  // Formats vidéo seuls (YouTube, Facebook — height peut être null)
   const videoOnlyFormats = formats.filter(
     (f) => f.vcodec && f.vcodec !== "none" && (!f.acodec || f.acodec === "none") && f.url
   )
@@ -70,11 +70,11 @@ function buildQualities(info, platform) {
     const byKey = {}
     for (const f of videoOnlyFormats) {
       const key = f.height ? `${f.height}p` : (f.format_note || f.format_id || "Video")
-      // Préférer H.264 (avc) sur VP9 à même résolution
-      const existing = byKey[key]
-      const fIsH264  = (f.vcodec || "").startsWith("avc")
-      const exIsH264 = existing ? (existing.vcodec || "").startsWith("avc") : false
-      if (!existing || (!exIsH264 && fIsH264) || (fIsH264 === exIsH264 && (f.tbr || 0) > (existing.tbr || 0))) {
+      // Préférer H.264 (avc) sur VP9 à hauteur identique
+      const cur = byKey[key]
+      const fH264  = (f.vcodec || "").startsWith("avc")
+      const curH264 = cur ? (cur.vcodec || "").startsWith("avc") : false
+      if (!cur || (!curH264 && fH264) || (fH264 === curH264 && (f.tbr || 0) > (cur.tbr || 0))) {
         byKey[key] = { ...f }
       }
     }
@@ -106,34 +106,43 @@ function buildQualities(info, platform) {
 
 // ─── Construire le format selector yt-dlp ────────────────────────────────
 //
-// Règle d'or : prioriser H.264 (vcodec^=avc) + AAC/m4a
-// → compatible QuickTime, iOS, Android, Windows Media Player
-// VP9/AV1 dans un MP4 = non lisible sur QuickTime natif
+// Objectif : H.264 + AAC natifs dans le fichier final
+//   → compatible QuickTime, iOS, Android, Windows sans réencodage
+//   → réencodage = lent + risque de perte audio si mal configuré
+//
+// Facebook : URLs signées expirent → sélecteur par hauteur uniquement
+// YouTube  : format_id stable → on l'utilise directement
 //
 function buildSelector(platform, formatId, height, needsMerge) {
   if (!needsMerge) {
-    // TikTok/Instagram merged : format direct, pas de merge
+    // TikTok / Instagram merged : format direct, pas de merge
     return formatId
   }
 
   if (platform === "facebook" || platform === "generic") {
-    // Facebook : URLs signées expirent → sélecteur par hauteur
-    // Toujours préférer H.264 (avc) avant VP9
+    // Facebook : URLs signées expirent → sélecteur basé sur hauteur
+    // On construit une chaîne de fallbacks du plus strict au plus permissif
     const h = height || 0
-    if (h > 0) {
-      return [
-        `bestvideo[height=${h}][vcodec^=avc]+bestaudio`,
-        `bestvideo[height<=${h}][vcodec^=avc]+bestaudio`,
-        `bestvideo[height<=${h}]+bestaudio`,
-        `bestvideo+bestaudio`,
-        `best`,
-      ].join("/")
-    }
-    return `bestvideo[vcodec^=avc]+bestaudio/bestvideo+bestaudio/best`
+    const hFilter = h > 0 ? `[height<=${h}]` : ""
+    const hExact  = h > 0 ? `[height=${h}]`  : ""
+
+    return [
+      // Idéal : H.264 + AAC m4a à la bonne hauteur
+      `bestvideo[vcodec^=avc]${hExact}+bestaudio[ext=m4a]`,
+      // H.264 + AAC à hauteur ≤
+      `bestvideo[vcodec^=avc]${hFilter}+bestaudio[ext=m4a]`,
+      // H.264 + n'importe quel audio
+      `bestvideo[vcodec^=avc]${hFilter}+bestaudio`,
+      // N'importe quelle vidéo + AAC m4a
+      `bestvideo${hFilter}+bestaudio[ext=m4a]`,
+      // N'importe quelle vidéo + n'importe quel audio
+      `bestvideo${hFilter}+bestaudio`,
+      // Dernier recours : meilleur format unique (déjà merged)
+      `best`,
+    ].join("/")
   }
 
   // YouTube / Instagram vidéo-only : format_id stable
-  // Préférer m4a pour l'audio (compatible mp4 sans réencodage)
   return [
     `${formatId}+bestaudio[ext=m4a]`,
     `${formatId}+bestaudio`,
@@ -209,16 +218,12 @@ app.post("/info", (req, res) => {
 
 // ─── GET /stream ──────────────────────────────────────────────────────────
 // Architecture fichier temporaire (obligatoire pour DASH/Facebook) :
-//   yt-dlp + ffmpeg → /tmp/uuid.mp4 complet → stream → suppression
+//   yt-dlp + ffmpeg merge → /tmp/uuid.mp4 complet → stream → suppression
 //
-// Pourquoi pas stdout pipe :
-//   ffmpeg doit écrire le moov atom à la FIN du fichier mp4.
-//   Sur un pipe → fichier TS corrompu sans piste vidéo reconnue.
-//
-// Pourquoi forcer H.264 :
-//   Facebook peut retourner VP9 dans un container mp4.
-//   VP9 dans mp4 = non lisible par QuickTime, iOS natif, Windows Media Player.
-//   On force H.264 via le sélecteur, et si indisponible on réencode via ffmpeg.
+// PAS de --postprocessor-args réencodage :
+//   Le réencodage avec --postprocessor-args ne mappe pas l'audio correctement
+//   → fichier avec vidéo seulement, pas d'audio
+//   Le sélecteur H.264+AAC natif est suffisant et plus rapide
 //
 app.get("/stream", async (req, res) => {
   const { url, formatId, height, title, needsMerge } = req.query
@@ -234,16 +239,14 @@ app.get("/stream", async (req, res) => {
   const selector = buildSelector(platform, safeFormatId, safeHeight, shouldMerge)
   const tmpFile  = join(tmpdir(), `dl_${randomUUID()}.mp4`)
 
-  console.log(`[stream] platform=${platform} h=${safeHeight} selector="${selector}" → ${tmpFile}`)
+  console.log(`[stream] platform=${platform} h=${safeHeight} selector="${selector}"`)
+  console.log(`[stream] tmpFile=${tmpFile}`)
 
   const args = [
     "--no-playlist",
     ...platformArgs(platform),
     "-f", selector,
     "--merge-output-format", "mp4",
-    // ✅ Si la vidéo finit en VP9 malgré le sélecteur → réencoder en H.264
-    // Cela garantit la compatibilité QuickTime/iOS/Windows sur tous les cas
-    "--postprocessor-args", "ffmpeg:-vcodec libx264 -crf 23 -preset fast -acodec aac -movflags +faststart",
     "-o", tmpFile,
     safeUrl,
   ]
@@ -285,7 +288,7 @@ app.get("/stream", async (req, res) => {
         return
       }
 
-      console.log(`[stream] Ready: ${(stats.size / 1e6).toFixed(1)} MB → streaming`)
+      console.log(`[stream] Ready: ${(stats.size / 1e6).toFixed(1)} MB → streaming to client`)
 
       res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.mp4"`)
       res.setHeader("Content-Type", "video/mp4")
