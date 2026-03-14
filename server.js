@@ -11,12 +11,11 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
-// ─── Utilitaire : exécuter une commande et retourner stdout ───────────────
-function run(cmd, args, opts = {}) {
+// ─── Utilitaire : exécuter une commande ──────────────────────────────────
+function run(cmd, args) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(cmd, args, opts)
-    let stdout = ""
-    let stderr = ""
+    const proc = spawn(cmd, args)
+    let stdout = "", stderr = ""
     proc.stdout?.on("data", (d) => { stdout += d.toString() })
     proc.stderr?.on("data", (d) => {
       stderr += d.toString()
@@ -24,7 +23,7 @@ function run(cmd, args, opts = {}) {
     })
     proc.on("close", (code) => {
       if (code === 0) resolve({ stdout, stderr })
-      else reject(new Error(`${cmd} exited ${code}: ${stderr.slice(-300)}`))
+      else reject(new Error(`${cmd} exited ${code}: ${stderr.slice(-400)}`))
     })
     proc.on("error", reject)
   })
@@ -42,10 +41,7 @@ function detectPlatform(url) {
 // ─── Args supplémentaires par plateforme ─────────────────────────────────
 function platformArgs(platform) {
   if (platform === "instagram") {
-    return [
-      "--add-header",
-      "User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-    ]
+    return ["--add-header", "User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"]
   }
   return []
 }
@@ -54,15 +50,18 @@ function platformArgs(platform) {
 function buildQualities(info, platform) {
   const formats = info.formats || []
 
+  // Formats avec vidéo ET audio fusionnés
   const mergedFormats = formats.filter(
     (f) => f.vcodec && f.vcodec !== "none" && f.acodec && f.acodec !== "none" && f.url
   )
+  // Formats vidéo seuls
   const videoOnlyFormats = formats.filter(
     (f) => f.vcodec && f.vcodec !== "none" && (!f.acodec || f.acodec === "none") && f.url
   )
 
   let qualities = []
 
+  // ── Formats merged (TikTok, Instagram, Facebook merged) ──
   if (mergedFormats.length > 0) {
     const byKey = {}
     for (const f of mergedFormats) {
@@ -73,10 +72,12 @@ function buildQualities(info, platform) {
       .sort((a, b) => (parseInt(b[0]) || 0) - (parseInt(a[0]) || 0))
       .map(([key, f]) => ({
         label: key, height: f.height || 0, formatId: f.format_id,
-        filesize: f.filesize || f.filesize_approx || null, needsMerge: false,
+        filesize: f.filesize || f.filesize_approx || null,
+        needsMerge: false,
       }))
   }
 
+  // ── Formats vidéo seuls (YouTube, Facebook DASH) ──
   if (videoOnlyFormats.length > 0) {
     const byKey = {}
     for (const f of videoOnlyFormats) {
@@ -98,7 +99,8 @@ function buildQualities(info, platform) {
       })
       .map(([key, f]) => ({
         label: key, height: f.height || 0, formatId: f.format_id,
-        filesize: f.filesize || f.filesize_approx || null, needsMerge: true,
+        filesize: f.filesize || f.filesize_approx || null,
+        needsMerge: true,
       }))
     qualities = [...qualities, ...voQ]
   }
@@ -157,21 +159,20 @@ app.post("/info", (req, res) => {
 
 // ─── GET /stream ──────────────────────────────────────────────────────────
 //
-// Architecture : 2 téléchargements séparés + merge ffmpeg explicite
+// STRATÉGIE PAR PLATEFORME :
 //
-//   Étape 1 : yt-dlp -f "bestvideo[vcodec^=avc]..."  → /tmp/uuid_v.mp4
-//   Étape 2 : yt-dlp -f "bestaudio"                  → /tmp/uuid_a.m4a
-//   Étape 3 : ffmpeg -i video -i audio
-//                    -map 0:v:0 -map 1:a:0            ← mapping EXPLICITE
-//                    -c:v copy -c:a aac               → /tmp/uuid_out.mp4
-//   Étape 4 : stream le fichier final → client
-//   Étape 5 : supprimer les 3 fichiers temp
+//  Facebook / generic (URLs signées qui expirent, pas d'audio-only):
+//    → yt-dlp -f "best[vcodec^=avc][height<=H]/best[height<=H]/best"
+//      = format merged (vidéo+audio déjà ensemble)
+//    → ffmpeg -map 0:v:0 -map 0:a:0 remuxe proprement en mp4
 //
-// Pourquoi cette approche :
-//   - Le merge interne yt-dlp ne garantit pas l'inclusion de l'audio
-//     quand l'ext de l'audio Facebook n'est pas reconnu comme compatible
-//   - ffmpeg avec -map explicite garantit que vidéo ET audio sont présents
-//   - -c:a aac réencode l'audio si nécessaire pour compatibilité QuickTime
+//  YouTube (format_id stable, audio-only disponible):
+//    → yt-dlp -f "formatId+bestaudio[ext=m4a]/formatId+bestaudio"
+//    → ffmpeg -map 0:v:0 -map 1:a:0 merge vidéo+audio
+//
+//  TikTok / Instagram merged (format_id direct, déjà vidéo+audio):
+//    → yt-dlp -f formatId directement
+//    → ffmpeg -map 0:v:0 -map 0:a:0 remuxe
 //
 app.get("/stream", async (req, res) => {
   const { url, formatId, height, title, needsMerge } = req.query
@@ -184,75 +185,98 @@ app.get("/stream", async (req, res) => {
   const platform     = detectPlatform(safeUrl)
   const shouldMerge  = needsMerge === "true"
 
-  const uid      = randomUUID()
-  const videoTmp = join(tmpdir(), `dl_${uid}_v.mp4`)
-  const audioTmp = join(tmpdir(), `dl_${uid}_a.m4a`)
-  const outTmp   = join(tmpdir(), `dl_${uid}_out.mp4`)
-
-  const cleanup  = () => Promise.all([videoTmp, audioTmp, outTmp].map((f) => unlink(f).catch(() => {})))
+  const uid    = randomUUID()
+  const rawTmp = join(tmpdir(), `dl_${uid}_raw.mp4`)   // téléchargement brut
+  const outTmp = join(tmpdir(), `dl_${uid}_out.mp4`)   // fichier final remuxé
+  const cleanup = () => Promise.all([rawTmp, outTmp].map((f) => unlink(f).catch(() => {})))
 
   console.log(`[stream] platform=${platform} h=${safeHeight} merge=${shouldMerge} uid=${uid}`)
 
   try {
-    if (!shouldMerge) {
-      // ── TikTok / Instagram merged : téléchargement direct ──────────────
-      console.log(`[stream] merged format, downloading directly`)
-      await run("yt-dlp", [
-        "--no-playlist",
-        ...platformArgs(platform),
-        "-f", safeFormatId,
-        "--merge-output-format", "mp4",
-        "-o", outTmp,
-        safeUrl,
-      ])
-    } else {
-      // ── Étape 1 : télécharger la vidéo (H.264 préféré) ─────────────────
+
+    if (platform === "facebook" || platform === "generic") {
+      // ── Facebook : télécharger le format merged (vidéo+audio ensemble) ──
+      // Pas de format audio-only disponible sur Facebook
+      // On prend le meilleur format merged H264, puis on remuxe avec ffmpeg
       const h = safeHeight
-      const hFilter = h > 0 ? `[height<=${h}]` : ""
+      const sel = [
+        h > 0 ? `best[vcodec^=avc][height=${h}]`  : null,
+        h > 0 ? `best[vcodec^=avc][height<=${h}]` : null,
+        `best[vcodec^=avc]`,
+        h > 0 ? `best[height<=${h}]` : null,
+        `best`,
+      ].filter(Boolean).join("/")
 
-      const videoSelector = [
-        `bestvideo[vcodec^=avc]${h > 0 ? `[height=${h}]` : ""}`,
-        `bestvideo[vcodec^=avc]${hFilter}`,
-        `bestvideo${hFilter}`,
-        `bestvideo`,
-      ].join("/")
+      console.log(`[stream] Facebook selector: ${sel}`)
+      await run("yt-dlp", ["--no-playlist", "-f", sel, "-o", rawTmp, safeUrl])
 
-      console.log(`[stream] Step 1 — video: ${videoSelector}`)
-      await run("yt-dlp", [
-        "--no-playlist",
-        ...platformArgs(platform),
-        "-f", videoSelector,
-        "-o", videoTmp,
-        safeUrl,
-      ])
-
-      // ── Étape 2 : télécharger l'audio séparément ───────────────────────
-      const audioSelector = "bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio"
-      console.log(`[stream] Step 2 — audio: ${audioSelector}`)
-      await run("yt-dlp", [
-        "--no-playlist",
-        ...platformArgs(platform),
-        "-f", audioSelector,
-        "-o", audioTmp,
-        safeUrl,
-      ])
-
-      // ── Étape 3 : merge ffmpeg avec mapping EXPLICITE ───────────────────
-      console.log(`[stream] Step 3 — ffmpeg merge with explicit -map`)
+      // Remuxer avec ffmpeg en forçant le mapping explicite vidéo+audio
+      console.log(`[stream] ffmpeg remux (Facebook merged → mp4)`)
       await run("ffmpeg", [
         "-y",
-        "-i", videoTmp,   // input 0 = vidéo
-        "-i", audioTmp,   // input 1 = audio
-        "-map", "0:v:0",  // prendre stream vidéo du fichier 0
-        "-map", "1:a:0",  // prendre stream audio du fichier 1
-        "-c:v", "copy",   // copier vidéo sans réencodage (rapide)
-        "-c:a", "aac",    // réencoder audio en AAC (compatible QuickTime/iOS)
-        "-movflags", "+faststart", // moov atom en début = lecture immédiate
+        "-i", rawTmp,
+        "-map", "0:v:0",       // stream vidéo
+        "-map", "0:a:0",       // stream audio
+        "-c:v", "copy",        // pas de réencodage vidéo
+        "-c:a", "aac",         // audio → AAC (compatible QuickTime/iOS)
+        "-movflags", "+faststart",
+        outTmp,
+      ])
+
+    } else if (shouldMerge) {
+      // ── YouTube / Instagram vidéo-only : 2 fichiers séparés ────────────
+      // Étape 1 : vidéo
+      const videoTmp = join(tmpdir(), `dl_${uid}_v.mp4`)
+      const audioTmp = join(tmpdir(), `dl_${uid}_a.m4a`)
+
+      const vSel = [
+        `${safeFormatId}`,
+      ].join("/")
+      console.log(`[stream] Step 1 video: ${vSel}`)
+      await run("yt-dlp", ["--no-playlist", ...platformArgs(platform), "-f", vSel, "-o", videoTmp, safeUrl])
+
+      // Étape 2 : audio
+      const aSel = "bestaudio[ext=m4a]/bestaudio"
+      console.log(`[stream] Step 2 audio: ${aSel}`)
+      await run("yt-dlp", ["--no-playlist", ...platformArgs(platform), "-f", aSel, "-o", audioTmp, safeUrl])
+
+      // Étape 3 : merge ffmpeg explicite
+      console.log(`[stream] Step 3 ffmpeg merge`)
+      await run("ffmpeg", [
+        "-y",
+        "-i", videoTmp,
+        "-i", audioTmp,
+        "-map", "0:v:0",   // vidéo du fichier 0
+        "-map", "1:a:0",   // audio du fichier 1
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-movflags", "+faststart",
+        outTmp,
+      ])
+
+      // Supprimer les fichiers intermédiaires
+      await Promise.all([unlink(videoTmp).catch(() => {}), unlink(audioTmp).catch(() => {})])
+
+    } else {
+      // ── TikTok / Instagram merged : téléchargement direct ──────────────
+      const sel = safeFormatId
+      console.log(`[stream] Merged format: ${sel}`)
+      await run("yt-dlp", ["--no-playlist", ...platformArgs(platform), "-f", sel, "-o", rawTmp, safeUrl])
+
+      // Remuxer pour garantir mp4 valide avec audio
+      await run("ffmpeg", [
+        "-y",
+        "-i", rawTmp,
+        "-map", "0:v:0",
+        "-map", "0:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-movflags", "+faststart",
         outTmp,
       ])
     }
 
-    // ── Étape 4 : vérifier et streamer ────────────────────────────────────
+    // ── Stream le fichier final ───────────────────────────────────────────
     const stats = await stat(outTmp)
     if (stats.size === 0) throw new Error("Output file is empty")
 
