@@ -1,6 +1,6 @@
 import express from "express"
 import cors from "cors"
-import { exec, spawn } from "child_process"
+import { spawn } from "child_process"
 
 const app = express()
 app.use(cors())
@@ -15,27 +15,46 @@ function detectPlatform(url) {
   return "generic"
 }
 
-// ─── Construction des qualités selon la plateforme ────────────────────────
+// ─── Extra args yt-dlp selon plateforme ───────────────────────────────────
+function platformArgs(platform) {
+  if (platform === "instagram") {
+    return [
+      "--add-header",
+      "User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+    ]
+  }
+  return []
+}
+
+// ─── Construction des qualités ────────────────────────────────────────────
 function buildQualities(info, platform) {
   const formats = info.formats || []
 
-  // Formats avec vidéo ET audio déjà fusionnés (TikTok, Instagram, Facebook)
+  // ── 1. Formats avec vidéo ET audio fusionnés (TikTok, Instagram parfois) ──
   const mergedFormats = formats.filter(
-    (f) => f.vcodec && f.vcodec !== "none" && f.acodec && f.acodec !== "none" && f.url
+    (f) =>
+      f.vcodec && f.vcodec !== "none" &&
+      f.acodec && f.acodec !== "none" &&
+      f.url
   )
 
-  // Formats vidéo seuls (YouTube — nécessitent fusion ffmpeg)
+  // ── 2. Formats vidéo seuls, avec ou sans height (YouTube, Facebook, Instagram DASH) ──
+  //   ✅ FIX: on ne filtre plus sur f.height — Facebook a height=null sur ses formats hd/sd
   const videoOnlyFormats = formats.filter(
-    (f) => f.vcodec && f.vcodec !== "none" && (!f.acodec || f.acodec === "none") && f.url && f.height
+    (f) =>
+      f.vcodec && f.vcodec !== "none" &&
+      (!f.acodec || f.acodec === "none") &&
+      f.url
   )
 
   let qualities = []
 
-  // ── Formats fusionnés (TikTok, Instagram, Facebook) ──
+  // ── Priorité aux formats fusionnés ──
   if (mergedFormats.length > 0) {
     const byKey = {}
     for (const f of mergedFormats) {
-      const key = f.height > 0
+      // Clé : résolution si dispo, sinon format_note (ex: "HD", "SD"), sinon format_id
+      const key = f.height
         ? `${f.height}p`
         : (f.format_note || f.format_id || "Best")
       if (!byKey[key] || (f.tbr || 0) > (byKey[key].tbr || 0)) {
@@ -43,38 +62,65 @@ function buildQualities(info, platform) {
       }
     }
     qualities = Object.entries(byKey)
-      .sort((a, b) => (parseInt(b[0]) || 0) - (parseInt(a[0]) || 0))
+      .sort((a, b) => {
+        const ha = parseInt(a[0]) || 0
+        const hb = parseInt(b[0]) || 0
+        if (hb !== ha) return hb - ha
+        // HD > SD si pas de chiffre
+        if (a[0].toLowerCase().includes("hd")) return -1
+        if (b[0].toLowerCase().includes("hd")) return  1
+        return 0
+      })
       .map(([key, f]) => ({
         label:      key,
         height:     f.height || 0,
-        formatId:   f.format_id,   // ← gardé intact, pas de strip
-        filesize:   f.filesize || f.filesize_approx || null,
-        needsMerge: false,         // déjà audio+vidéo
-      }))
-  }
-
-  // ── Formats vidéo seuls (YouTube) ──
-  if (videoOnlyFormats.length > 0) {
-    const byHeight = {}
-    for (const f of videoOnlyFormats) {
-      const h = f.height
-      if (!byHeight[h] || (f.tbr || 0) > (byHeight[h].tbr || 0)) byHeight[h] = f
-    }
-    const ytQ = Object.entries(byHeight)
-      .sort((a, b) => Number(b[0]) - Number(a[0]))
-      .map(([height, f]) => ({
-        label:      `${height}p`,
-        height:     Number(height),
         formatId:   f.format_id,
         filesize:   f.filesize || f.filesize_approx || null,
-        needsMerge: true,          // fusion ffmpeg requise
+        needsMerge: false,
       }))
-    qualities = [...qualities, ...ytQ]
   }
 
-  // ── Fallback : rien trouvé ──
+  // ── Formats vidéo seuls → needsMerge: true ──
+  if (videoOnlyFormats.length > 0) {
+    const byKey = {}
+    for (const f of videoOnlyFormats) {
+      // Clé : résolution si dispo, sinon format_note (HD/SD), sinon format_id
+      const key = f.height
+        ? `${f.height}p`
+        : (f.format_note || f.format_id || "Best")
+      if (!byKey[key] || (f.tbr || 0) > (byKey[key].tbr || 0)) {
+        byKey[key] = { ...f, _key: key }
+      }
+    }
+    const voQ = Object.entries(byKey)
+      .sort((a, b) => {
+        const ha = parseInt(a[0]) || 0
+        const hb = parseInt(b[0]) || 0
+        if (hb !== ha) return hb - ha
+        if (a[0].toLowerCase().includes("hd")) return -1
+        if (b[0].toLowerCase().includes("hd")) return  1
+        return 0
+      })
+      .map(([key, f]) => ({
+        label:      key,
+        height:     f.height || 0,
+        formatId:   f.format_id,
+        filesize:   f.filesize || f.filesize_approx || null,
+        needsMerge: true,   // ← fusion ffmpeg requise (audio séparé)
+      }))
+    qualities = [...qualities, ...voQ]
+  }
+
+  // ── Fallback absolu si rien trouvé ──
   if (qualities.length === 0) {
-    qualities = [{ label: "Best", height: 0, formatId: "best", filesize: null, needsMerge: false }]
+    // "bestvideo+bestaudio" garantit vidéo+son même sans connaître le formatId
+    qualities = [{
+      label:      "Best",
+      height:     0,
+      formatId:   "bestvideo",
+      filesize:   null,
+      needsMerge: true,    // ← TOUJOURS merger pour être sûr d'avoir le son
+    }]
   }
 
   return qualities
@@ -93,16 +139,8 @@ app.post("/info", (req, res) => {
   const platform = detectPlatform(url)
   const safeUrl  = url.replace(/"/g, "").trim()
 
-  // Args de base
-  const args = ["--no-playlist", "-j"]
-
-  // Instagram : user-agent mobile
-  if (platform === "instagram") {
-    args.push("--add-header", "User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15")
-  }
-
-  args.push(safeUrl)
-  console.log(`[info] platform=${platform} args=${args.join(" ")}`)
+  const args = ["--no-playlist", "-j", ...platformArgs(platform), safeUrl]
+  console.log(`[info] platform=${platform} url=${safeUrl}`)
 
   const proc = spawn("yt-dlp", args, { timeout: 45000 })
   let stdout = ""
@@ -113,13 +151,18 @@ app.post("/info", (req, res) => {
 
   proc.on("close", (code) => {
     if (code !== 0) {
-      console.error(`[info] yt-dlp exit ${code}:`, stderr.slice(0, 400))
+      console.error(`[info] yt-dlp exit ${code}:`, stderr.slice(0, 500))
       let msg = "Unable to fetch this video"
-      if (stderr.includes("Private") || stderr.includes("private"))         msg = "This video is private or inaccessible"
-      else if (stderr.includes("not a video"))                               msg = "This link does not point to a video"
-      else if (platform === "instagram" && stderr.includes("login"))        msg = "This Instagram post requires login"
-      else if (platform === "tiktok"    && stderr.includes("Unable"))       msg = "TikTok video inaccessible — make sure the link is public"
-      else if (platform === "facebook"  && stderr.includes("login"))        msg = "This Facebook video is private"
+      if (stderr.includes("Private") || stderr.includes("private"))
+        msg = "This video is private or inaccessible"
+      else if (stderr.includes("not a video"))
+        msg = "This link does not point to a video"
+      else if (platform === "instagram" && stderr.includes("login"))
+        msg = "This Instagram post requires login"
+      else if (platform === "tiktok" && stderr.includes("Unable"))
+        msg = "TikTok video inaccessible — make sure the link is public"
+      else if (platform === "facebook" && stderr.includes("login"))
+        msg = "This Facebook video requires login"
       return res.status(500).json({ error: msg })
     }
 
@@ -128,10 +171,13 @@ app.post("/info", (req, res) => {
     catch { return res.status(500).json({ error: "Parsing error" }) }
 
     const qualities = buildQualities(info, platform)
-    console.log(`[info] ${qualities.length} quality(ies) — needsMerge=${qualities.map(q=>q.needsMerge)}`)
+    console.log(
+      `[info] ${qualities.length} quality(ies):`,
+      qualities.map((q) => `${q.label}(merge=${q.needsMerge})`).join(", ")
+    )
 
     res.json({
-      title:       info.title    || "Video",
+      title:       info.title     || "Video",
       thumbnail:   info.thumbnail || null,
       duration:    info.duration  || null,
       uploader:    info.uploader  || info.channel || info.creator || null,
@@ -154,11 +200,10 @@ app.get("/stream", (req, res) => {
 
   const safeUrl = String(url).replace(/"/g, "").trim()
 
-  // ✅ FIX CRITIQUE : on garde les underscores, tirets, points, chiffres, lettres
-  // Les format_id TikTok ressemblent à : "h264_540p_4193159-0" ou "playAddr"
-  // L'ancien regex /[^a-z0-9+\-]/gi supprimait les underscores → formatId corrompu → 0B
+  // ✅ Sanitize formatId : garde lettres, chiffres, tirets, underscores, points
+  // (les format_id Facebook/TikTok ressemblent à "hd", "sd", "h264_540p_xxx-0")
   const safeFormatId = String(formatId)
-    .replace(/['";\s\\<>|&]/g, "")  // seulement les chars vraiment dangereux
+    .replace(/['";\s\\<>|&]/g, "")
     .substring(0, 120)
 
   const safeTitle = String(title || "video")
@@ -166,34 +211,31 @@ app.get("/stream", (req, res) => {
     .replace(/\s+/g, "_")
     .substring(0, 80)
 
-  const platform = detectPlatform(safeUrl)
-
-  // ✅ FIX : needsMerge vient comme string "true"/"false" depuis l'URL query
+  const platform    = detectPlatform(safeUrl)
   const shouldMerge = needsMerge === "true"
 
-  console.log(`[stream] platform=${platform} formatId="${safeFormatId}" merge=${shouldMerge}`)
+  console.log(
+    `[stream] platform=${platform} formatId="${safeFormatId}" merge=${shouldMerge}`
+  )
 
   res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.mp4"`)
   res.setHeader("Content-Type", "video/mp4")
 
-  const args = ["--no-playlist"]
-
-  // Instagram : user-agent mobile
-  if (platform === "instagram") {
-    args.push("--add-header", "User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15")
-  }
+  const args = ["--no-playlist", ...platformArgs(platform)]
 
   if (shouldMerge) {
-    // YouTube : vidéo seule + audio séparé → fusion ffmpeg
+    // Vidéo seule + meilleur audio disponible → fusion ffmpeg → mp4
+    // Fallbacks : m4a d'abord (compatible mp4), sinon n'importe quel audio
     args.push(
-      "-f", `${safeFormatId}+bestaudio[ext=m4a]/bestaudio`,
+      "-f", `${safeFormatId}+bestaudio[ext=m4a]/${safeFormatId}+bestaudio`,
       "--merge-output-format", "mp4"
     )
   } else {
-    // TikTok / Instagram / Facebook : format déjà fusionné → direct
-    args.push("-f", safeFormatId)
-    // Si le format n'est pas déjà mp4, on convertit à la volée
-    args.push("--merge-output-format", "mp4")
+    // Format déjà fusionné (TikTok, Instagram merged) → direct
+    args.push(
+      "-f", safeFormatId,
+      "--merge-output-format", "mp4"  // convertit si besoin (webm→mp4 etc.)
+    )
   }
 
   args.push("-o", "-", safeUrl)
@@ -201,7 +243,7 @@ app.get("/stream", (req, res) => {
   const ytdlp = spawn("yt-dlp", args)
 
   ytdlp.stdout.pipe(res)
-  ytdlp.stderr.on("data", (d) => console.log("[stream] yt-dlp:", d.toString().trim()))
+  ytdlp.stderr.on("data", (d) => console.log("[stream]", d.toString().trim()))
   ytdlp.on("error", (err) => {
     console.error("[stream] spawn error:", err)
     if (!res.headersSent) res.status(500).end()
@@ -212,5 +254,8 @@ app.get("/stream", (req, res) => {
   req.on("close", () => ytdlp.kill())
 })
 
+// ─── Dockerfile hint: pip3 install yt-dlp curl_cffi --break-system-packages
 const PORT = process.env.PORT || 8080
-app.listen(PORT, "0.0.0.0", () => console.log(`Server running on port ${PORT}`))
+app.listen(PORT, "0.0.0.0", () =>
+  console.log(`Server running on port ${PORT}`)
+)
