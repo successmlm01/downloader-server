@@ -241,7 +241,19 @@ app.get("/stream", async (req, res) => {
     )
   }
 
-  // ✅ Écriture dans fichier temp (pas stdout)
+  // ✅ Re-encode H.264 + AAC + faststart → compatibilité universelle
+  //    QuickTime, Safari, iPhone, Android, tous les navigateurs
+  //    -c:v libx264       → H.264, codec le plus compatible
+  //    -profile:v high    → qualité max H.264
+  //    -pix_fmt yuv420p   → OBLIGATOIRE pour QuickTime/Safari
+  //    -c:a aac           → audio AAC standard
+  //    -movflags +faststart → moov atom au début
+  args.push(
+    "--postprocessor-args",
+    "ffmpeg:-c:v libx264 -profile:v high -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart"
+  )
+
+  // ✅ Écriture dans fichier temp (pas stdout pipe)
   args.push("-o", tmpFile, safeUrl)
 
   const ytdlp = spawn("yt-dlp", args)
