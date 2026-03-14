@@ -3,7 +3,7 @@ import cors from "cors"
 import { spawn } from "child_process"
 import { randomUUID } from "crypto"
 import { unlink, stat } from "fs/promises"
-import { createReadStream, existsSync } from "fs"
+import { createReadStream } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
 
@@ -11,7 +11,7 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
-// ─── Détection de plateforme ───────────────────────────────────────────────
+// ─── Détection de plateforme ──────────────────────────────────────────────
 function detectPlatform(url) {
   if (/tiktok\.com/i.test(url))             return "tiktok"
   if (/instagram\.com/i.test(url))          return "instagram"
@@ -20,7 +20,7 @@ function detectPlatform(url) {
   return "generic"
 }
 
-// ─── Args supplémentaires par plateforme ──────────────────────────────────
+// ─── Args supplémentaires par plateforme ─────────────────────────────────
 function platformArgs(platform) {
   if (platform === "instagram") {
     return [
@@ -29,6 +29,47 @@ function platformArgs(platform) {
     ]
   }
   return []
+}
+
+// ─── Trouver le meilleur format audio pour une vidéo ─────────────────────
+function findAudioPair(videoFormat, allFormats) {
+  const vid = videoFormat.format_id || ""
+
+  // Facebook: format_id vidéo = "12345v" → audio = "12345a"
+  if (vid.endsWith("v")) {
+    const audioId = vid.slice(0, -1) + "a"
+    const found = allFormats.find((f) => f.format_id === audioId)
+    if (found) return audioId
+  }
+
+  // Chercher n'importe quel format audio seul (acodec ok, vcodec none)
+  const audioOnly = allFormats.filter(
+    (f) => f.acodec && f.acodec !== "none" && (!f.vcodec || f.vcodec === "none")
+  )
+  if (audioOnly.length > 0) {
+    // Prendre le meilleur bitrate
+    audioOnly.sort((a, b) => (b.tbr || 0) - (a.tbr || 0))
+    return audioOnly[0].format_id
+  }
+
+  return null
+}
+
+// ─── Construction du format selector pour yt-dlp ─────────────────────────
+// Retourne le sélecteur à passer à -f
+function buildFormatSelector(formatId, audioId, shouldMerge) {
+  if (!shouldMerge) {
+    // Format déjà fusionné (TikTok, Instagram merged)
+    return formatId
+  }
+
+  if (audioId) {
+    // On connaît l'audio pair exact → sélecteur précis
+    return `${formatId}+${audioId}`
+  }
+
+  // Fallbacks YouTube-style
+  return `${formatId}+bestaudio[ext=m4a]/${formatId}+bestaudio`
 }
 
 // ─── Construction des qualités ────────────────────────────────────────────
@@ -43,7 +84,7 @@ function buildQualities(info, platform) {
       f.url
   )
 
-  // Formats vidéo seuls — ✅ height optionnel (Facebook hd/sd n'ont pas height)
+  // Formats vidéo seuls (YouTube, Facebook DASH — height peut être null)
   const videoOnlyFormats = formats.filter(
     (f) =>
       f.vcodec && f.vcodec !== "none" &&
@@ -53,7 +94,7 @@ function buildQualities(info, platform) {
 
   let qualities = []
 
-  // ── Formats fusionnés en priorité ──
+  // ── Priorité : formats déjà fusionnés ──
   if (mergedFormats.length > 0) {
     const byKey = {}
     for (const f of mergedFormats) {
@@ -70,12 +111,13 @@ function buildQualities(info, platform) {
         label:      key,
         height:     f.height || 0,
         formatId:   f.format_id,
+        audioId:    null,           // déjà merged, pas besoin
         filesize:   f.filesize || f.filesize_approx || null,
         needsMerge: false,
       }))
   }
 
-  // ── Formats vidéo seuls → needsMerge: true ──
+  // ── Formats vidéo seuls → needsMerge: true, avec audio pair ──
   if (videoOnlyFormats.length > 0) {
     const byKey = {}
     for (const f of videoOnlyFormats) {
@@ -91,15 +133,16 @@ function buildQualities(info, platform) {
         const ha = parseInt(a[0]) || 0
         const hb = parseInt(b[0]) || 0
         if (hb !== ha) return hb - ha
-        // HD avant SD si pas de chiffre
-        if (a[0] === "hd" || a[0].toLowerCase().includes("hd")) return -1
-        if (b[0] === "hd" || b[0].toLowerCase().includes("hd")) return  1
+        if (a[0].toLowerCase().includes("hd")) return -1
+        if (b[0].toLowerCase().includes("hd")) return  1
         return 0
       })
       .map(([key, f]) => ({
         label:      key,
         height:     f.height || 0,
         formatId:   f.format_id,
+        // ✅ Stocker l'audio pair au moment du /info pour l'utiliser au /stream
+        audioId:    findAudioPair(f, formats),
         filesize:   f.filesize || f.filesize_approx || null,
         needsMerge: true,
       }))
@@ -112,6 +155,7 @@ function buildQualities(info, platform) {
       label:      "Best",
       height:     0,
       formatId:   "bestvideo",
+      audioId:    null,
       filesize:   null,
       needsMerge: true,
     }]
@@ -120,12 +164,12 @@ function buildQualities(info, platform) {
   return qualities
 }
 
-// ─── GET / ─────────────────────────────────────────────────────────────────
+// ─── GET / ───────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.send("DownloadAllInOne API — YouTube · TikTok · Instagram · Facebook")
 })
 
-// ─── POST /info ────────────────────────────────────────────────────────────
+// ─── POST /info ───────────────────────────────────────────────────────────
 app.post("/info", (req, res) => {
   const { url } = req.body
   if (!url) return res.status(400).json({ error: "No URL provided" })
@@ -167,7 +211,7 @@ app.post("/info", (req, res) => {
     const qualities = buildQualities(info, platform)
     console.log(
       `[info] ${qualities.length} quality(ies):`,
-      qualities.map((q) => `${q.label}(merge=${q.needsMerge})`).join(", ")
+      qualities.map((q) => `${q.label}(fid=${q.formatId} aid=${q.audioId} merge=${q.needsMerge})`).join(" | ")
     )
 
     res.json({
@@ -187,28 +231,23 @@ app.post("/info", (req, res) => {
   })
 })
 
-// ─── GET /stream ───────────────────────────────────────────────────────────
-// Architecture fichier temporaire :
-//   1. yt-dlp télécharge + merge dans /tmp/uuid.mp4
-//   2. Une fois terminé, on streame le fichier vers le client
-//   3. On supprime le fichier temp
+// ─── GET /stream ──────────────────────────────────────────────────────────
+// Architecture fichier temporaire:
+//   yt-dlp télécharge + ffmpeg merge → /tmp/uuid.mp4 → on streame → on supprime
 //
-// Pourquoi pas stdout pipe ?
-//   Facebook DASH: yt-dlp télécharge segments séparés puis les fusionnent via ffmpeg.
-//   ffmpeg ne peut pas écrire un mp4 valide sur stdout pendant ce process
-//   (il a besoin d'écrire le moov atom à la fin du fichier).
-//   Résultat avec pipe: fichier .ts corrompu sans piste vidéo reconnue.
+// Pourquoi pas stdout pipe?
+//   Facebook/DASH: ffmpeg a besoin d'écrire le moov atom à la FIN du fichier.
+//   Sur un pipe, impossible → fichier .ts corrompu sans piste vidéo.
 //
 app.get("/stream", async (req, res) => {
-  const { url, formatId, title, needsMerge } = req.query
+  const { url, formatId, audioId, title, needsMerge } = req.query
   if (!url || !formatId) return res.status(400).json({ error: "url and formatId required" })
 
   const safeUrl = String(url).replace(/"/g, "").trim()
 
-  // Sanitize formatId: garder lettres, chiffres, tirets, underscores, points
-  const safeFormatId = String(formatId)
-    .replace(/['";\s\\<>|&]/g, "")
-    .substring(0, 120)
+  // Sanitize: garder lettres, chiffres, tirets, underscores — pas les chars dangereux
+  const safeFormatId = String(formatId).replace(/['";\s\\<>|&]/g, "").substring(0, 120)
+  const safeAudioId  = audioId ? String(audioId).replace(/['";\s\\<>|&]/g, "").substring(0, 120) : null
 
   const safeTitle = String(title || "video")
     .replace(/[^\w\s\-]/gi, "")
@@ -218,54 +257,34 @@ app.get("/stream", async (req, res) => {
   const platform    = detectPlatform(safeUrl)
   const shouldMerge = needsMerge === "true"
 
+  // ✅ Format selector avec audio pair précis si dispo
+  const formatSelector = buildFormatSelector(safeFormatId, safeAudioId, shouldMerge)
+
   // Fichier temporaire unique
   const tmpFile = join(tmpdir(), `dl_${randomUUID()}.mp4`)
 
   console.log(
-    `[stream] platform=${platform} formatId="${safeFormatId}" merge=${shouldMerge} tmp=${tmpFile}`
+    `[stream] platform=${platform} selector="${formatSelector}" merge=${shouldMerge} → ${tmpFile}`
   )
 
-  const args = ["--no-playlist", ...platformArgs(platform)]
-
-  if (shouldMerge) {
-    // Vidéo seule + audio séparé → fusion ffmpeg → mp4
-    args.push(
-      "-f", `${safeFormatId}+bestaudio[ext=m4a]/${safeFormatId}+bestaudio`,
-      "--merge-output-format", "mp4"
-    )
-  } else {
-    // Format déjà fusionné (TikTok, Instagram merged)
-    args.push(
-      "-f", safeFormatId,
-      "--merge-output-format", "mp4"
-    )
-  }
-
-  // ✅ Re-encode H.264 + AAC + faststart → compatibilité universelle
-  //    QuickTime, Safari, iPhone, Android, tous les navigateurs
-  //    -c:v libx264       → H.264, codec le plus compatible
-  //    -profile:v high    → qualité max H.264
-  //    -pix_fmt yuv420p   → OBLIGATOIRE pour QuickTime/Safari
-  //    -c:a aac           → audio AAC standard
-  //    -movflags +faststart → moov atom au début
-  args.push(
-    "--postprocessor-args",
-    "ffmpeg:-c:v libx264 -profile:v high -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart"
-  )
-
-  // ✅ Écriture dans fichier temp (pas stdout pipe)
-  args.push("-o", tmpFile, safeUrl)
+  const args = [
+    "--no-playlist",
+    ...platformArgs(platform),
+    "-f", formatSelector,
+    "--merge-output-format", "mp4",
+    "-o", tmpFile,
+    safeUrl,
+  ]
 
   const ytdlp = spawn("yt-dlp", args)
-  let stderr = ""
+  let stderrLog = ""
 
   ytdlp.stderr.on("data", (d) => {
     const line = d.toString().trim()
-    stderr += line + "\n"
+    stderrLog += line + "\n"
     console.log("[stream] yt-dlp:", line)
   })
 
-  // Gérer l'annulation client
   let aborted = false
   req.on("close", () => {
     if (!res.writableEnded) {
@@ -279,23 +298,22 @@ app.get("/stream", async (req, res) => {
     if (aborted) return
 
     if (code !== 0) {
-      console.error(`[stream] yt-dlp exited ${code}`)
-      if (!res.headersSent) res.status(500).json({ error: "Download failed" })
+      console.error(`[stream] yt-dlp exited ${code}`, stderrLog.slice(-300))
+      if (!res.headersSent) res.status(500).json({ error: "Download failed — check the URL is public" })
       unlink(tmpFile).catch(() => {})
       return
     }
 
-    // Vérifier que le fichier existe et n'est pas vide
     try {
       const stats = await stat(tmpFile)
       if (stats.size === 0) {
         console.error("[stream] Temp file is empty!")
-        if (!res.headersSent) res.status(500).json({ error: "Empty file — format may be unsupported" })
+        if (!res.headersSent) res.status(500).json({ error: "Empty file — format unavailable" })
         unlink(tmpFile).catch(() => {})
         return
       }
 
-      console.log(`[stream] File ready: ${(stats.size / 1e6).toFixed(1)} MB, streaming...`)
+      console.log(`[stream] Ready: ${(stats.size / 1e6).toFixed(1)} MB → streaming`)
 
       res.setHeader("Content-Disposition", `attachment; filename="${safeTitle}.mp4"`)
       res.setHeader("Content-Type", "video/mp4")
@@ -305,10 +323,10 @@ app.get("/stream", async (req, res) => {
       readStream.pipe(res)
       readStream.on("close", () => {
         unlink(tmpFile).catch(() => {})
-        console.log(`[stream] Done, temp file deleted`)
+        console.log(`[stream] Sent & cleaned up`)
       })
     } catch (err) {
-      console.error("[stream] Error reading temp file:", err)
+      console.error("[stream] File error:", err)
       if (!res.headersSent) res.status(500).json({ error: "File not found after download" })
       unlink(tmpFile).catch(() => {})
     }
@@ -322,6 +340,4 @@ app.get("/stream", async (req, res) => {
 })
 
 const PORT = process.env.PORT || 8080
-app.listen(PORT, "0.0.0.0", () =>
-  console.log(`Server running on port ${PORT}`)
-)
+app.listen(PORT, "0.0.0.0", () => console.log(`Server running on port ${PORT}`))
