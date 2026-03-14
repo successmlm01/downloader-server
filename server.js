@@ -40,7 +40,7 @@ function buildQualities(info, platform) {
     (f) => f.vcodec && f.vcodec !== "none" && f.acodec && f.acodec !== "none" && f.url
   )
 
-  // Formats vidéo seuls — height optionnel (Facebook "hd"/"sd" n'ont pas height)
+  // Formats vidéo seuls — height optionnel (Facebook hd/sd n'ont pas height)
   const videoOnlyFormats = formats.filter(
     (f) => f.vcodec && f.vcodec !== "none" && (!f.acodec || f.acodec === "none") && f.url
   )
@@ -70,7 +70,13 @@ function buildQualities(info, platform) {
     const byKey = {}
     for (const f of videoOnlyFormats) {
       const key = f.height ? `${f.height}p` : (f.format_note || f.format_id || "Video")
-      if (!byKey[key] || (f.tbr || 0) > (byKey[key].tbr || 0)) byKey[key] = { ...f }
+      // Préférer H.264 (avc) sur VP9 à même résolution
+      const existing = byKey[key]
+      const fIsH264  = (f.vcodec || "").startsWith("avc")
+      const exIsH264 = existing ? (existing.vcodec || "").startsWith("avc") : false
+      if (!existing || (!exIsH264 && fIsH264) || (fIsH264 === exIsH264 && (f.tbr || 0) > (existing.tbr || 0))) {
+        byKey[key] = { ...f }
+      }
     }
     const voQ = Object.entries(byKey)
       .sort((a, b) => {
@@ -99,28 +105,39 @@ function buildQualities(info, platform) {
 }
 
 // ─── Construire le format selector yt-dlp ────────────────────────────────
-// Pour Facebook : on ne peut pas réutiliser le format_id (URLs signées qui expirent).
-// On utilise un sélecteur basé sur la hauteur max souhaitée.
-// Pour YouTube : on utilise le format_id exact (stable car pas d'URL signée).
-// Pour TikTok/Instagram merged : format_id direct, pas de merge.
+//
+// Règle d'or : prioriser H.264 (vcodec^=avc) + AAC/m4a
+// → compatible QuickTime, iOS, Android, Windows Media Player
+// VP9/AV1 dans un MP4 = non lisible sur QuickTime natif
+//
 function buildSelector(platform, formatId, height, needsMerge) {
   if (!needsMerge) {
-    // Format déjà fusionné → direct
+    // TikTok/Instagram merged : format direct, pas de merge
     return formatId
   }
 
   if (platform === "facebook" || platform === "generic") {
-    // Facebook : URLs signées expirent → sélecteur basé sur la hauteur
+    // Facebook : URLs signées expirent → sélecteur par hauteur
+    // Toujours préférer H.264 (avc) avant VP9
     const h = height || 0
     if (h > 0) {
-      // Essaie d'abord la hauteur exacte, puis ≤hauteur, puis best
-      return `bestvideo[height=${h}]+bestaudio/bestvideo[height<=${h}]+bestaudio/bestvideo+bestaudio/best`
+      return [
+        `bestvideo[height=${h}][vcodec^=avc]+bestaudio`,
+        `bestvideo[height<=${h}][vcodec^=avc]+bestaudio`,
+        `bestvideo[height<=${h}]+bestaudio`,
+        `bestvideo+bestaudio`,
+        `best`,
+      ].join("/")
     }
-    return `bestvideo+bestaudio/best`
+    return `bestvideo[vcodec^=avc]+bestaudio/bestvideo+bestaudio/best`
   }
 
   // YouTube / Instagram vidéo-only : format_id stable
-  return `${formatId}+bestaudio[ext=m4a]/${formatId}+bestaudio`
+  // Préférer m4a pour l'audio (compatible mp4 sans réencodage)
+  return [
+    `${formatId}+bestaudio[ext=m4a]`,
+    `${formatId}+bestaudio`,
+  ].join("/")
 }
 
 // ─── GET / ───────────────────────────────────────────────────────────────
@@ -195,8 +212,13 @@ app.post("/info", (req, res) => {
 //   yt-dlp + ffmpeg → /tmp/uuid.mp4 complet → stream → suppression
 //
 // Pourquoi pas stdout pipe :
-//   ffmpeg a besoin d'écrire le moov atom à la FIN du fichier mp4.
-//   Impossible sur un pipe → fichier TS corrompu sans piste vidéo.
+//   ffmpeg doit écrire le moov atom à la FIN du fichier mp4.
+//   Sur un pipe → fichier TS corrompu sans piste vidéo reconnue.
+//
+// Pourquoi forcer H.264 :
+//   Facebook peut retourner VP9 dans un container mp4.
+//   VP9 dans mp4 = non lisible par QuickTime, iOS natif, Windows Media Player.
+//   On force H.264 via le sélecteur, et si indisponible on réencode via ffmpeg.
 //
 app.get("/stream", async (req, res) => {
   const { url, formatId, height, title, needsMerge } = req.query
@@ -209,18 +231,19 @@ app.get("/stream", async (req, res) => {
   const platform     = detectPlatform(safeUrl)
   const shouldMerge  = needsMerge === "true"
 
-  // Sélecteur adapté à la plateforme
   const selector = buildSelector(platform, safeFormatId, safeHeight, shouldMerge)
+  const tmpFile  = join(tmpdir(), `dl_${randomUUID()}.mp4`)
 
-  const tmpFile = join(tmpdir(), `dl_${randomUUID()}.mp4`)
-
-  console.log(`[stream] platform=${platform} height=${safeHeight} selector="${selector}" → ${tmpFile}`)
+  console.log(`[stream] platform=${platform} h=${safeHeight} selector="${selector}" → ${tmpFile}`)
 
   const args = [
     "--no-playlist",
     ...platformArgs(platform),
     "-f", selector,
     "--merge-output-format", "mp4",
+    // ✅ Si la vidéo finit en VP9 malgré le sélecteur → réencoder en H.264
+    // Cela garantit la compatibilité QuickTime/iOS/Windows sur tous les cas
+    "--postprocessor-args", "ffmpeg:-vcodec libx264 -crf 23 -preset fast -acodec aac -movflags +faststart",
     "-o", tmpFile,
     safeUrl,
   ]
