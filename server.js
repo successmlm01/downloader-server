@@ -268,12 +268,32 @@ app.get("/stream", async (req, res) => {
     res.setHeader("Content-Type", "video/mp4")
     res.setHeader("Content-Length", stats.size)
 
+    // Track the successful download with real metadata
+    trackDownload({
+      platform: platform,
+      quality:  safeHeight ? `${safeHeight}` : "?",
+      size_mb:  stats.size / 1e6,
+      title:    String(req.query.title || "Video"),
+      status:   "ok",
+    })
+
     const rs = createReadStream(outTmp)
     rs.pipe(res)
     rs.on("close", () => { cleanup(); console.log("[stream] Sent & cleaned up") })
 
   } catch (err) {
     console.error("[stream] Error:", err.message)
+    // Track error
+    adminStats.errors_today++
+    adminStats.recent.unshift({
+      platform: detectPlatform(String(req.query.url || "")),
+      quality:  "?",
+      size_mb:  0,
+      title:    String(req.query.title || "Video").slice(0, 80),
+      status:   "error",
+      ts:       Date.now(),
+    })
+    if (adminStats.recent.length > 20) adminStats.recent.pop()
     cleanup()
     if (!res.headersSent) res.status(500).json({ error: "Download failed — " + err.message.split("\n")[0] })
   }
@@ -293,10 +313,14 @@ const adminStats = {
   downloads_today: 0,
   downloads_total: 0,
   errors_today:    0,
-  recentLogs:      [],   // last 100 log entries
+  bandwidth_mb:    0,
+  by_platform:     { youtube: 0, tiktok: 0, instagram: 0, facebook: 0 },
+  by_quality:      { "4K": 0, "1080p": 0, "720p": 0, "≤480p": 0 },
+  recent:          [],  // last 20 downloads
+  recentLogs:      [],  // last 100 log entries
 }
 
-// Patch console.log/error to capture logs
+// Patch console to capture logs
 const origLog   = console.log.bind(console)
 const origError = console.error.bind(console)
 const origWarn  = console.warn.bind(console)
@@ -311,20 +335,46 @@ console.log   = (...a) => { origLog(...a);   pushLog("info",  a.join(" ")) }
 console.error = (...a) => { origError(...a); pushLog("error", a.join(" ")) }
 console.warn  = (...a) => { origWarn(...a);  pushLog("warn",  a.join(" ")) }
 
-// Track successful downloads
-function trackDownload() {
+// Track a completed download with full metadata
+function trackDownload({ platform, quality, size_mb, title, status }) {
   adminStats.downloads_today++
   adminStats.downloads_total++
+  adminStats.bandwidth_mb += size_mb || 0
+
+  // By platform
+  const p = platform || "generic"
+  if (p in adminStats.by_platform) adminStats.by_platform[p]++
+
+  // By quality bucket
+  const h = parseInt(quality) || 0
+  if (h >= 2160)      adminStats.by_quality["4K"]++
+  else if (h >= 1080) adminStats.by_quality["1080p"]++
+  else if (h >= 720)  adminStats.by_quality["720p"]++
+  else                adminStats.by_quality["≤480p"]++
+
+  // Recent list
+  adminStats.recent.unshift({
+    platform: p,
+    quality:  quality || "?",
+    size_mb:  Math.round(size_mb || 0),
+    title:    (title || "Video").slice(0, 80),
+    status:   status || "ok",
+    ts:       Date.now(),
+  })
+  if (adminStats.recent.length > 20) adminStats.recent.pop()
 }
 
 // Reset daily counters at midnight
 function scheduleDailyReset() {
-  const now   = new Date()
-  const next  = new Date(now)
+  const now  = new Date()
+  const next = new Date(now)
   next.setHours(24, 0, 0, 0)
   setTimeout(() => {
     adminStats.downloads_today = 0
     adminStats.errors_today    = 0
+    adminStats.bandwidth_mb    = 0
+    adminStats.by_platform     = { youtube: 0, tiktok: 0, instagram: 0, facebook: 0 }
+    adminStats.by_quality      = { "4K": 0, "1080p": 0, "720p": 0, "≤480p": 0 }
     scheduleDailyReset()
   }, next - now)
 }
@@ -374,19 +424,16 @@ app.get("/admin/stats", requireAdmin, async (req, res) => {
   res.json({
     downloads_today:  adminStats.downloads_today,
     downloads_total:  adminStats.downloads_total,
-    visitors_today:   0,  // tracked by Vercel / analytics
+    visitors_today:   0,
     errors_today:     adminStats.errors_today,
     avg_response_s:   3.2,
-    success_rate:     adminStats.downloads_today > 0
+    success_rate:     (adminStats.downloads_today + adminStats.errors_today) > 0
       ? ((adminStats.downloads_today / (adminStats.downloads_today + adminStats.errors_today)) * 100).toFixed(1)
       : 100,
-    bandwidth_gb:     adminStats.downloads_total * 78 / 1024, // ~78MB avg
-    by_platform:      { youtube: 61, tiktok: 19, instagram: 11, facebook: 9 },
-    by_quality:       { "4K": 0, "1080p": 0, "720p": 0, "≤480p": 0 },
-    recent:           adminStats.recentLogs
-      .filter(l => l.msg.includes("[stream]") && l.msg.includes("Ready"))
-      .slice(0, 8)
-      .map(l => ({ platform: "unknown", quality: "—", size_mb: 0, status: "ok", ts: l.ts })),
+    bandwidth_gb:     (adminStats.bandwidth_mb / 1024).toFixed(2),
+    by_platform:      adminStats.by_platform,
+    by_quality:       adminStats.by_quality,
+    recent:           adminStats.recent,
     server: {
       cpu, ram, disk,
       ytdlp_ok:   ytdlpOk,
